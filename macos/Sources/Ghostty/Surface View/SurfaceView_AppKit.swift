@@ -225,6 +225,12 @@ extension Ghostty {
         // should suppress the matching mouse-up from being reported.
         private var suppressNextLeftMouseUp: Bool = false
 
+        // Stores the first keyDown event when a Korean IME activates from dormant state,
+        // so it can be replayed together with the next keyDown for correct composition.
+        private var pendingIMEActivationEvent: NSEvent?
+        private var pendingIMEKeyboardId: String?
+        private var isReplayingDeferredKey: Bool = false
+
         // A small delay that is introduced before a title change to avoid flickers
         private var titleChangeTimer: Timer?
 
@@ -799,7 +805,15 @@ extension Ghostty {
 
         override func becomeFirstResponder() -> Bool {
             let result = super.becomeFirstResponder()
-            if result { focusDidChange(true) }
+            if result {
+                focusDidChange(true)
+                DistributedNotificationCenter.default().addObserver(
+                    self,
+                    selector: #selector(keyboardSelectionDidChange(_:)),
+                    name: NSNotification.Name("com.apple.Carbon.TISNotifySelectedKeyboardInputSourceChanged"),
+                    object: nil
+                )
+            }
             return result
         }
 
@@ -808,9 +822,24 @@ extension Ghostty {
 
             // We sometimes call this manually (see SplitView) as a way to force us to
             // yield our focus state.
-            if result { focusDidChange(false) }
+            if result {
+                focusDidChange(false)
+                DistributedNotificationCenter.default().removeObserver(
+                    self,
+                    name: NSNotification.Name("com.apple.Carbon.TISNotifySelectedKeyboardInputSourceChanged"),
+                    object: nil
+                )
+                discardPendingIMEActivation()
+            }
 
             return result
+        }
+
+        @objc private func keyboardSelectionDidChange(_ notification: NSNotification) {
+            self.inputContext?.activate()
+            if let storedId = pendingIMEKeyboardId, storedId != KeyboardLayout.id {
+                discardPendingIMEActivation()
+            }
         }
 
         override func updateTrackingAreas() {
@@ -1143,7 +1172,15 @@ extension Ghostty {
             // `interpretKeyEvents` may dispatch it.
             self.lastPerformKeyEvent = nil
 
-            self.interpretKeyEvents([translationEvent])
+            if let pendingEvent = pendingIMEActivationEvent {
+                pendingIMEActivationEvent = nil
+                pendingIMEKeyboardId = nil
+                isReplayingDeferredKey = true
+                self.interpretKeyEvents([pendingEvent, translationEvent])
+                isReplayingDeferredKey = false
+            } else {
+                self.interpretKeyEvents([translationEvent])
+            }
 
             // If our keyboard changed from this we just assume an input method
             // grabbed it and do nothing.
@@ -1168,7 +1205,7 @@ extension Ghostty {
                         text: text
                     )
                 }
-            } else {
+            } else if pendingIMEActivationEvent == nil {
                 // We have no accumulated text so this is a normal key event.
                 _ = keyAction(
                     action,
@@ -1803,7 +1840,7 @@ extension Ghostty.SurfaceView: NSTextInputClient {
     }
 
     func markedRange() -> NSRange {
-        guard markedText.length > 0 else { return NSRange() }
+        guard markedText.length > 0 else { return NSRange(location: NSNotFound, length: 0) }
         return NSRange(0...(markedText.length-1))
     }
 
@@ -1969,12 +2006,32 @@ extension Ghostty.SurfaceView: NSTextInputClient {
         // If we have an accumulator we're in another key event so we just
         // accumulate and return.
         if var acc = keyTextAccumulator {
+            if acc.isEmpty, markedText.length == 0, pendingIMEActivationEvent == nil,
+               !isReplayingDeferredKey, isSingleKoreanConsonant(chars) {
+                pendingIMEActivationEvent = NSApp.currentEvent
+                pendingIMEKeyboardId = KeyboardLayout.id
+                markedText = NSMutableAttributedString(string: chars)
+                return
+            }
             acc.append(chars)
             keyTextAccumulator = acc
             return
         }
 
         surfaceModel.sendText(chars)
+    }
+
+    /// Returns true if the string is a single standalone Korean consonant (compatibility jamo).
+    private func isSingleKoreanConsonant(_ s: String) -> Bool {
+        guard s.unicodeScalars.count == 1, let scalar = s.unicodeScalars.first else { return false }
+        return (0x3131...0x314E).contains(scalar.value)
+    }
+
+    /// Clears any pending IME activation state and unmarks text if needed.
+    private func discardPendingIMEActivation() {
+        pendingIMEActivationEvent = nil
+        pendingIMEKeyboardId = nil
+        if !markedText.string.isEmpty { unmarkText() }
     }
 
     /// This function needs to exist for two reasons:
